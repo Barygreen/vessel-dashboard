@@ -25,7 +25,7 @@ REGION_CONFIG = {
 }
 
 PORT_REGION_MAP = {
-    "NEW YORK": ("USA East", "NY"), "NEWARK": ("USA East", "NY"),
+    "NEW YORK": ("USA East", "NY"), "NEWARK": ("USA East", "NY"), "USNYC": ("USA East", "NY"), "NY": ("USA East", "NY"),
     "CHARLESTON": ("USA East", "Charleston"), "SAVANNAH": ("USA East", "Sav"), "NORFOLK": ("USA East", "Norfolk"),
     "LOS ANGELES": ("USA West", "LA"), "LONG BEACH": ("USA West", "LA"),
     "SHANGHAI": ("China", "Shanghai"), "NINGBO": ("China", "Ningbo"), "QINGDAO": ("China", "Qingdao"),
@@ -137,16 +137,36 @@ def calculate_tts(etd_str, eta_str, default_tts):
 
 def clean_vessel_name(name):
     if pd.isna(name) or str(name).lower() == 'nan': return "-"
-    return re.sub(r'\[.*?\]', '', str(name).upper()).strip()
+    name = re.sub(r'\[.*?\]', '', str(name)).strip()
+    return name.upper()
 
 def extract_voyage(voy):
     if pd.isna(voy) or str(voy).lower() == 'nan': return "-"
-    return str(voy).upper().strip().lstrip('0')
+    # Removed lstrip('0') so HMM voyages like 0138W stay exact
+    return str(voy).upper().strip()
 
 def find_col(df, keywords):
-    for c in df.columns:
-        if any(k in str(c).lower() for k in keywords): return c
+    # Prioritizes exact keyword order instead of scanning left to right
+    for k in keywords:
+        for c in df.columns:
+            if k in str(c).lower():
+                return c
     return None
+
+def determine_region(dest_str):
+    dest_upper = str(dest_str).upper().strip()
+    
+    # 1. Exact Matches First
+    for k, v in PORT_REGION_MAP.items():
+        if k == dest_upper:
+            return v
+            
+    # 2. Strict Word Boundary Match
+    for k, v in PORT_REGION_MAP.items():
+        if re.search(r'\b' + re.escape(k) + r'\b', dest_upper):
+            return v
+            
+    return ("USA East", "NY") # Safe default
 
 # --- PARSING ENGINES ---
 def parse_file(uploaded_file):
@@ -160,7 +180,6 @@ def parse_file(uploaded_file):
         else:
             engine = 'xlrd' if name.endswith('.xls') else 'openpyxl'
             xls = pd.ExcelFile(uploaded_file, engine=engine)
-            # Read ALL sheets to prevent missing any vessel mappings
             dfs = [pd.read_excel(xls, sheet_name=s) for s in xls.sheet_names]
             
     except Exception as e:
@@ -169,7 +188,7 @@ def parse_file(uploaded_file):
             try:
                 uploaded_file.seek(0)
                 html_content = uploaded_file.read().decode('utf-8', errors='ignore')
-                dfs = [parse_html_table(html_content)] # Dependency-free HMM unlocker
+                dfs = [parse_html_table(html_content)]
             except Exception as html_err:
                 st.error(f"Failed to read {uploaded_file.name} as an HTML table: {html_err}")
                 return []
@@ -184,13 +203,13 @@ def parse_file(uploaded_file):
         file_year = year_match.group(0) if year_match else str(datetime.now().year)
 
         try:
-            # 1. CMA CGM Engine
+            # 1. CMA CGM Engine - FIX: Prioritizing Final Destination
             if 'vessel name' in cols_str or 'voyage ref' in cols_str:
                 v_col = find_col(df, ['vessel name', 'vessel'])
                 voy_col = find_col(df, ['voyage ref', 'voyage'])
-                dest_col = find_col(df, ['destination', 'arrival location', 'pod'])
+                dest_col = find_col(df, ['final destination', 'destination', 'port of discharge', 'pod', 'arrival'])
                 doc_col = find_col(df, ['si cut-off', 'si cutoff', 'doc cut'])
-                fcl_col = find_col(df, ['standard booking', 'port cut', 'cy cut', 'vgm cut'])
+                fcl_col = find_col(df, ['cy cut', 'port cut', 'vgm cut', 'standard booking'])
                 etd_col = find_col(df, ['departure date', 'etd'])
                 eta_col = find_col(df, ['arrival date', 'eta'])
                 tts_col = find_col(df, ['transit time', 'tts'])
@@ -199,11 +218,10 @@ def parse_file(uploaded_file):
 
                 for _, r in df.iterrows():
                     v_raw = str(r.get(v_col, '-'))
-                    # Skip vertical headers stacked inside the data
                     if str(v_raw).lower() in ['nan', 'vessel name', 'vessel', '-']: continue
                     
                     dest = str(r.get(dest_col, '')).upper()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
                     
                     service = str(r.get(svc_col, '-')).strip() if svc_col else "-"
                     if service.lower() == 'nan': service = "-"
@@ -237,7 +255,8 @@ def parse_file(uploaded_file):
                     if str(v_raw).lower() in ['nan', 'vessel name', '-']: continue
                     
                     dest = str(r.get('Arrival location', '')).upper()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
+                    
                     cell = str(r.get('Doc Cut-off/FCL Cut-off/VGM Cut-off', ''))
                     splits = cell.split('/') if '/' in cell else [cell, cell]
                     
@@ -269,7 +288,7 @@ def parse_file(uploaded_file):
                     
                     parts = vv.rsplit(' ', 1)
                     dest = str(r.iloc[4] if len(r) > 4 else "").upper()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
                     
                     service = str(r.iloc[9]).replace('\n', ' ').strip() if len(r) > 9 else "-"
                     if service.lower() == 'nan': service = "-"
@@ -307,7 +326,7 @@ def parse_file(uploaded_file):
                     
                     parts = vv.rsplit(' ', 1)
                     dest = str(r_top.iloc[2] if len(r_top) > 2 else "").upper()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
                     
                     fcl_str = str(r_top.iloc[4] if len(r_top) > 4 else "").replace('CY Cutoff:', '')
                     doc_str = str(r_bot.iloc[4] if len(r_bot) > 4 else "").replace('SI Cutoff:', '')
@@ -345,7 +364,7 @@ def parse_file(uploaded_file):
                     if str(v_raw).lower() in ['nan', 'vessel', '-']: continue
 
                     dest = str(r.get('Arrival', '')).upper().split('-')[0].strip()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
                     
                     doc_raw = normalize_date(r.get('Deadline SI - NON AMS', '-'), file_year)
                     fcl_raw = normalize_date(r.get('Deadline CY', '-'), file_year)
@@ -371,7 +390,7 @@ def parse_file(uploaded_file):
                     if str(vessel_raw).lower() in ['nan', 'vessel', '-']: continue
 
                     dest = str(r.get('DischargingPort', '')).upper()
-                    reg, pod = next((v for k, v in PORT_REGION_MAP.items() if k in dest), ("USA East", "NY"))
+                    reg, pod = determine_region(dest)
                     
                     service = str(r.get('Route', '-')).strip()
                     if service.lower() == 'nan': service = "-"
@@ -382,9 +401,14 @@ def parse_file(uploaded_file):
 
                     first_vessel = vessel_raw.split('\t')[0]
                     first_vessel = re.sub(r'\[.*?\]', '', first_vessel).strip()
+                    
                     v_parts = first_vessel.rsplit(' ', 1)
-                    v_name = clean_vessel_name(v_parts[0])
-                    voy_no = extract_voyage(v_parts[1] if len(v_parts)>1 else "-")
+                    if len(v_parts) > 1 and bool(re.search(r'\d', v_parts[1])):
+                        v_name = clean_vessel_name(v_parts[0])
+                        voy_no = extract_voyage(v_parts[1])
+                    else:
+                        v_name = clean_vessel_name(first_vessel)
+                        voy_no = "-"
 
                     etd_raw = str(r.get('Loading Port', ''))
                     etd_match = re.search(r'ETD\s*:\s*(\d{4}-\d{2}-\d{2})', etd_raw)
